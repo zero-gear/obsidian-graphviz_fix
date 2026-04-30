@@ -18,6 +18,14 @@ export class Processors {
         ['svg', 'image/svg+xml']
     ]);
 
+  private extractGraphClasses(source: string): string[] {
+    const stringBeforeBrace = source.split('{', 1)[0]?.trim() || '';
+    return stringBeforeBrace
+      .split(/\s+/)
+      .map(token => token.replace(/[^\w-]/g, ''))
+      .filter(token => token.length > 0);
+  }
+
   private async writeDotFile(sourceFile: string): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
       const cmdPath = this.plugin.settings.dotPath;
@@ -75,20 +83,37 @@ export class Processors {
   }
 
   public async imageProcessor(source: string, el: HTMLElement, _: MarkdownPostProcessorContext): Promise<void> {
-    const stringBeforeBrace = source.split("{", 1)[0]?.trim() || "";
-    const wordsBeforeBrace = stringBeforeBrace.split();
+    const wordsBeforeBrace = this.extractGraphClasses(source);
 
     try {
       console.debug('Call image processor');
       //make sure url is defined. once the setting gets reset to default, an empty string will be returned by settings
       const imageData = await this.convertToImage(source);
-      const blob = new Blob([ imageData ], {'type': this.imageMimeType.get(this.plugin.settings.imageFormat)});
-      const url = window.URL || window.webkitURL;
-      const blobUrl = url.createObjectURL(blob);
-      const img = document.createElement('img');
-      img.setAttribute("class", "graphviz " + wordsBeforeBrace.join(" "));
-      img.setAttribute("src", blobUrl);
-      el.appendChild(img);
+      const blobData = new Uint8Array(imageData);
+      if (this.plugin.settings.imageFormat === 'svg') {
+        const svgText = new TextDecoder().decode(blobData);
+        const parser = new DOMParser();
+        const parsedSvg = parser.parseFromString(svgText, 'image/svg+xml');
+        const svgRoot = parsedSvg.documentElement;
+
+        if (svgRoot.tagName.toLowerCase() !== 'svg') {
+          throw new Error('Invalid SVG output from dot executable.');
+        }
+
+        const graphClasses = ['graphviz', ...wordsBeforeBrace].join(' ').trim();
+        svgRoot.setAttribute('class', graphClasses);
+
+        // Inline SVG keeps Graphviz URL and tooltip interactivity.
+        el.appendChild(document.importNode(svgRoot, true));
+      } else {
+        const blob = new Blob([ blobData ], {'type': this.imageMimeType.get(this.plugin.settings.imageFormat)});
+        const url = window.URL || window.webkitURL;
+        const blobUrl = url.createObjectURL(blob);
+        const img = document.createElement('img');
+        img.setAttribute('class', 'graphviz ' + wordsBeforeBrace.join(' '));
+        img.setAttribute('src', blobUrl);
+        el.appendChild(img);
+      }
     } catch (errMessage) {
       console.error('convert to image error', errMessage);
       const pre = document.createElement('pre');
@@ -102,8 +127,7 @@ export class Processors {
   public async d3graphvizProcessor(source: string, el: HTMLElement, _: MarkdownPostProcessorContext): Promise<void> {
     console.debug('Call d3graphvizProcessor');
 
-    const stringBeforeBrace = source.split("{", 1)[0]?.trim() || "";
-    const wordsBeforeBrace = stringBeforeBrace.split();
+    const wordsBeforeBrace = this.extractGraphClasses(source);
 
     const div = document.createElement('div');
     const graphId = 'd3graph_' + createHash('md5').update(source).digest('hex').substring(0, 6);
