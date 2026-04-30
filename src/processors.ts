@@ -83,9 +83,20 @@ export class Processors {
     const href = imageHref.split('#')[0]?.split('?')[0] || imageHref;
     const candidatePaths: string[] = [];
     const dotWorkingDirectory = this.getDotWorkingDirectory(sourcePath);
+    const adapter = this.plugin.app.vault.adapter as { getFullPath?: (p: string) => string };
 
-    if (path.isAbsolute(href)) {
-      candidatePaths.push(href);
+    if (href.startsWith('/')) {
+      // In Obsidian, "/..." should resolve from vault root, not OS filesystem root.
+      const vaultRelativePath = normalizePath(href.slice(1));
+      if (adapter.getFullPath) {
+        candidatePaths.push(adapter.getFullPath(vaultRelativePath));
+      }
+
+      // Backward-compatible fallback: if href is an existing OS absolute path,
+      // allow embedding it as a data URI to avoid broken image stubs.
+      if (path.isAbsolute(href)) {
+        candidatePaths.push(href);
+      }
     } else if (dotWorkingDirectory) {
       candidatePaths.push(path.resolve(dotWorkingDirectory, href));
     }
@@ -110,6 +121,45 @@ export class Processors {
     }
     const absoluteNotePath = adapter.getFullPath(sourcePath);
     return path.dirname(absoluteNotePath);
+  }
+
+  private resolveDotImagePathForGraphviz(imageHref: string): string {
+    // Keep external/data/hash references unchanged.
+    if (/^(?:[a-z]+:|data:|#)/i.test(imageHref)) {
+      return imageHref;
+    }
+
+    if (!imageHref.startsWith('/')) {
+      // Keep note-relative paths unchanged; dot resolves them from cwd.
+      return imageHref;
+    }
+
+    // Treat "/..." as vault-root absolute path.
+    const adapter = this.plugin.app.vault.adapter as { getFullPath?: (p: string) => string };
+    if (!adapter.getFullPath) {
+      return imageHref;
+    }
+    const vaultRelativePath = normalizePath(imageHref.slice(1));
+    return adapter.getFullPath(vaultRelativePath);
+  }
+
+  private rewriteDotImagePathsForGraphviz(source: string): string {
+    let rewritten = source;
+
+    rewritten = rewritten.replace(/(image\s*=\s*")([^"]+)(")/g, (_match, prefix, href, suffix) => {
+      return `${prefix}${this.resolveDotImagePathForGraphviz(href)}${suffix}`;
+    });
+    rewritten = rewritten.replace(/(image\s*=\s*')([^']+)(')/g, (_match, prefix, href, suffix) => {
+      return `${prefix}${this.resolveDotImagePathForGraphviz(href)}${suffix}`;
+    });
+    rewritten = rewritten.replace(/(<IMG\b[^>]*\bSRC\s*=\s*")([^"]+)(")/gi, (_match, prefix, href, suffix) => {
+      return `${prefix}${this.resolveDotImagePathForGraphviz(href)}${suffix}`;
+    });
+    rewritten = rewritten.replace(/(<IMG\b[^>]*\bSRC\s*=\s*')([^']+)(')/gi, (_match, prefix, href, suffix) => {
+      return `${prefix}${this.resolveDotImagePathForGraphviz(href)}${suffix}`;
+    });
+
+    return rewritten;
   }
 
   private async writeDotFile(sourceFile: string, dotWorkingDirectory?: string): Promise<Uint8Array> {
@@ -175,7 +225,8 @@ export class Processors {
     try {
       console.debug('Call image processor');
       //make sure url is defined. once the setting gets reset to default, an empty string will be returned by settings
-      const imageData = await this.convertToImage(source, ctx.sourcePath);
+      const sourceForDot = this.rewriteDotImagePathsForGraphviz(source);
+      const imageData = await this.convertToImage(sourceForDot, ctx.sourcePath);
       const blobData = new Uint8Array(imageData);
       if (this.plugin.settings.imageFormat === 'svg') {
         const svgText = new TextDecoder().decode(blobData);
