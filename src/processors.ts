@@ -1,7 +1,8 @@
-import { MarkdownPostProcessorContext } from 'obsidian';
+import { MarkdownPostProcessorContext, normalizePath, TFile } from 'obsidian';
 import * as tmp from 'tmp';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
+import * as path from 'path';
 import { createHash } from 'crypto';
 import GraphvizPlugin from './main';
 // import {graphviz} from 'd3-graphviz'; => does not work, ideas how to embed d3 into the plugin?
@@ -26,14 +27,52 @@ export class Processors {
       .filter(token => token.length > 0);
   }
 
-  private async writeDotFile(sourceFile: string): Promise<Uint8Array> {
+  private resolveVaultImagePath(imageHref: string, sourcePath: string): string | null {
+    // External/data URLs should be left untouched.
+    if (/^(?:[a-z]+:|data:|#)/i.test(imageHref)) {
+      return null;
+    }
+
+    const href = imageHref.split('#')[0]?.split('?')[0] || imageHref;
+    const candidates: string[] = [];
+
+    if (href.startsWith('/')) {
+      candidates.push(href.slice(1));
+    } else {
+      const cleanedHref = href.startsWith('./') ? href.slice(2) : href;
+      const sourceDir = sourcePath.includes('/') ? sourcePath.slice(0, sourcePath.lastIndexOf('/')) : '';
+      if (sourceDir.length > 0) {
+        candidates.push(normalizePath(`${sourceDir}/${cleanedHref}`));
+      }
+      candidates.push(normalizePath(cleanedHref));
+    }
+
+    for (const candidate of candidates) {
+      const abstractFile = this.plugin.app.vault.getAbstractFileByPath(candidate);
+      if (abstractFile instanceof TFile) {
+        return abstractFile.path;
+      }
+    }
+    return null;
+  }
+
+  private getDotWorkingDirectory(sourcePath: string): string | undefined {
+    const adapter = this.plugin.app.vault.adapter as { getFullPath?: (p: string) => string };
+    if (!adapter.getFullPath) {
+      return undefined;
+    }
+    const absoluteNotePath = adapter.getFullPath(sourcePath);
+    return path.dirname(absoluteNotePath);
+  }
+
+  private async writeDotFile(sourceFile: string, dotWorkingDirectory?: string): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
       const cmdPath = this.plugin.settings.dotPath;
       const imageFormat = this.plugin.settings.imageFormat;
       const parameters = [ `-T${imageFormat}`, `-Gbgcolor=transparent`, `-Gstylesheet=obs-gviz.css`, sourceFile ];
 
       console.debug(`Starting dot process ${cmdPath}, ${parameters}`);
-      const dotProcess = spawn(cmdPath, parameters);
+      const dotProcess = spawn(cmdPath, parameters, dotWorkingDirectory ? { cwd: dotWorkingDirectory } : undefined);
       const outData: Array<Uint8Array> = [];
       let errData = '';
 
@@ -57,8 +96,9 @@ export class Processors {
     });
   }
 
-  private async convertToImage(source: string): Promise<Uint8Array> {
+  private async convertToImage(source: string, sourcePath: string): Promise<Uint8Array> {
     const self = this;
+    const dotWorkingDirectory = this.getDotWorkingDirectory(sourcePath);
     return new Promise<Uint8Array>((resolve, reject) => {
       tmp.file(function (err, tmpPath, fd, _/* cleanupCallback */) {
         if (err) reject(err);
@@ -74,7 +114,7 @@ export class Processors {
                 reject(`close ${tmpPath} error ${err}`);
                 return;
               }
-              return self.writeDotFile(tmpPath).then(data => resolve(data)).catch(message => reject(message));
+              return self.writeDotFile(tmpPath, dotWorkingDirectory).then(data => resolve(data)).catch(message => reject(message));
             }
           );
         });
@@ -82,13 +122,13 @@ export class Processors {
     });
   }
 
-  public async imageProcessor(source: string, el: HTMLElement, _: MarkdownPostProcessorContext): Promise<void> {
+  public async imageProcessor(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext): Promise<void> {
     const wordsBeforeBrace = this.extractGraphClasses(source);
 
     try {
       console.debug('Call image processor');
       //make sure url is defined. once the setting gets reset to default, an empty string will be returned by settings
-      const imageData = await this.convertToImage(source);
+      const imageData = await this.convertToImage(source, ctx.sourcePath);
       const blobData = new Uint8Array(imageData);
       if (this.plugin.settings.imageFormat === 'svg') {
         const svgText = new TextDecoder().decode(blobData);
@@ -98,6 +138,21 @@ export class Processors {
 
         if (svgRoot.tagName.toLowerCase() !== 'svg') {
           throw new Error('Invalid SVG output from dot executable.');
+        }
+
+        const images = Array.from(svgRoot.querySelectorAll('image'));
+        for (const imageElement of images) {
+          const href = imageElement.getAttribute('href') || imageElement.getAttribute('xlink:href');
+          if (!href) {
+            continue;
+          }
+          const vaultPath = this.resolveVaultImagePath(href, ctx.sourcePath);
+          if (!vaultPath) {
+            continue;
+          }
+          const resourceUrl = this.plugin.app.vault.adapter.getResourcePath(vaultPath);
+          imageElement.setAttribute('href', resourceUrl);
+          imageElement.setAttribute('xlink:href', resourceUrl);
         }
 
         const graphClasses = ['graphviz', ...wordsBeforeBrace].join(' ').trim();
