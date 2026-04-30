@@ -56,6 +56,53 @@ export class Processors {
     return null;
   }
 
+  private getImageMimeType(imagePath: string): string {
+    const extension = path.extname(imagePath).toLowerCase();
+    switch (extension) {
+      case '.png':
+        return 'image/png';
+      case '.jpg':
+      case '.jpeg':
+        return 'image/jpeg';
+      case '.gif':
+        return 'image/gif';
+      case '.webp':
+        return 'image/webp';
+      case '.svg':
+        return 'image/svg+xml';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+
+  private async tryBuildDataUriForLocalImage(imageHref: string, sourcePath: string): Promise<string | null> {
+    if (/^(?:[a-z]+:|data:|#)/i.test(imageHref)) {
+      return null;
+    }
+
+    const href = imageHref.split('#')[0]?.split('?')[0] || imageHref;
+    const candidatePaths: string[] = [];
+    const dotWorkingDirectory = this.getDotWorkingDirectory(sourcePath);
+
+    if (path.isAbsolute(href)) {
+      candidatePaths.push(href);
+    } else if (dotWorkingDirectory) {
+      candidatePaths.push(path.resolve(dotWorkingDirectory, href));
+    }
+
+    for (const candidatePath of candidatePaths) {
+      try {
+        await fs.promises.access(candidatePath, fs.constants.R_OK);
+        const imageContent = await fs.promises.readFile(candidatePath);
+        const mimeType = this.getImageMimeType(candidatePath);
+        return `data:${mimeType};base64,${imageContent.toString('base64')}`;
+      } catch (_error) {
+        // Ignore inaccessible candidates and continue trying.
+      }
+    }
+    return null;
+  }
+
   private getDotWorkingDirectory(sourcePath: string): string | undefined {
     const adapter = this.plugin.app.vault.adapter as { getFullPath?: (p: string) => string };
     if (!adapter.getFullPath) {
@@ -147,12 +194,18 @@ export class Processors {
             continue;
           }
           const vaultPath = this.resolveVaultImagePath(href, ctx.sourcePath);
-          if (!vaultPath) {
+          if (vaultPath) {
+            const resourceUrl = this.plugin.app.vault.adapter.getResourcePath(vaultPath);
+            imageElement.setAttribute('href', resourceUrl);
+            imageElement.setAttribute('xlink:href', resourceUrl);
             continue;
           }
-          const resourceUrl = this.plugin.app.vault.adapter.getResourcePath(vaultPath);
-          imageElement.setAttribute('href', resourceUrl);
-          imageElement.setAttribute('xlink:href', resourceUrl);
+
+          const localDataUri = await this.tryBuildDataUriForLocalImage(href, ctx.sourcePath);
+          if (localDataUri) {
+            imageElement.setAttribute('href', localDataUri);
+            imageElement.setAttribute('xlink:href', localDataUri);
+          }
         }
 
         const graphClasses = ['graphviz', ...wordsBeforeBrace].join(' ').trim();
